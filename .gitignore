@@ -33,7 +33,7 @@ go.work
 *.swp
 *.swo
 
-# Node / Next.js (for future phases)
+# Node / Next.js
 node_modules/
 .next/
 out/
