@@ -29,6 +29,21 @@ type Website struct {
 
 var db *sql.DB
 
+func enableCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 func checkSite(url string) Result {
 	start := time.Now()
 
@@ -186,8 +201,6 @@ func checkAllMonitors() {
 			}
 
 			db.Exec("UPDATE monitors SET status = $1 WHERE id = $2", status, s.ID)
-
-			fmt.Printf("[CHECK] %s -> %s (Status: %d, %dms)\n", s.URL, status, res.Status, res.Latency.Milliseconds())
 		}(site)
 	}
 
@@ -209,8 +222,11 @@ func startBackgroundChecker() {
 
 func main() {
 	connStr := "postgres://localhost:5432/uptime?sslmode=disable"
+	mux := http.DefaultServeMux
+
 	var err error
 	db, err = sql.Open("postgres", connStr)
+
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -228,5 +244,5 @@ func main() {
 
 	go startBackgroundChecker()
 
-	http.ListenAndServe(":8080", nil)
+	http.ListenAndServe(":8080", enableCORS(mux))
 }
