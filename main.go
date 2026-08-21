@@ -134,6 +134,14 @@ func sendDiscordAlert(webhookURL string, job CheckJob, res Result, newStatus str
 		{Name: "Checked At", Value: time.Now().Format("15:04:05 MST"), Inline: true},
 	}
 
+	if res.ErrorMessage != "" {
+		fields = append(fields, DiscordField{
+			Name:   "Reason",
+			Value:  res.ErrorMessage,
+			Inline: false,
+		})
+	}
+
 	payload := DiscordPayload{
 		Username: "WatchDawg",
 		Embeds: []DiscordEmbed{
@@ -224,6 +232,23 @@ func checkSite(url string) Result {
 		ErrorMessage: errMsg,
 	}
 
+}
+
+func checkSiteWithRetry(url string, maxRetries int) Result {
+	var res Result
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		res = checkSite(url)
+		if res.Success {
+			return res
+		}
+
+		if attempt < maxRetries {
+			backoff := time.Duration(attempt) * time.Second
+			time.Sleep(backoff)
+		}
+	}
+
+	return res
 }
 
 func handleGetWebsites(w http.ResponseWriter, r *http.Request) {
@@ -547,11 +572,11 @@ func startWorker(workerID int) {
 			continue
 		}
 
-		res := checkSite(job.URL)
+		res := checkSiteWithRetry(job.URL, 2)
 
 		_, err = db.Exec(
-			"INSERT INTO checks (monitor_id, status_code, latency_ms, success) VALUES ($1, $2, $3, $4)",
-			job.MonitorID, res.Status, res.Latency.Milliseconds(), res.Success,
+			"INSERT INTO checks (monitor_id, status_code, latency_ms, success, error_message) VALUES ($1, $2, $3, $4, $5)",
+			job.MonitorID, res.Status, res.Latency.Milliseconds(), res.Success, res.ErrorMessage,
 		)
 		if err != nil {
 			log.Printf("Worker %d failed to save check: %v\n", workerID, err)

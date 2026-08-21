@@ -21,5 +21,6 @@ CREATE TABLE IF NOT EXISTS checks (
     status_code INTEGER,
     latency_ms INTEGER,
     success BOOLEAN,
+    error_message TEXT,
     checked_at TIMESTAMPTZ DEFAULT NOW()
 );
