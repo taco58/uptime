@@ -11,7 +11,8 @@ CREATE TABLE IF NOT EXISTS monitors (
     url TEXT NOT NULL,
     status VARCHAR(50) DEFAULT 'unknown',
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    webhook_url TEXT
 );
 
 CREATE TABLE IF NOT EXISTS checks (

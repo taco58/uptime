@@ -1,35 +1,40 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/bcrypt"
 )
 
 type Result struct {
-	URL     string
-	Status  int
-	Latency time.Duration
-	Success bool
+	URL          string        `json:"url"`
+	Status       int           `json:"status"`
+	Latency      time.Duration `json:"latency"`
+	Success      bool          `json:"success"`
+	ErrorMessage string        `json:"error_message,omitempty"`
 }
 
 type Website struct {
-	ID     int    `json:"id"`
-	URL    string `json:"url"`
-	Name   string `json:"name"`
-	Status string `json:"status"`
+	ID         int     `json:"id"`
+	URL        string  `json:"url"`
+	Name       string  `json:"name"`
+	Status     string  `json:"status"`
+	WebhookURL *string `json:"webhook_url,omitempty"`
 }
 
 type User struct {
@@ -49,8 +54,53 @@ type AuthResponse struct {
 	Token string `json:"token"`
 }
 
+type CheckJob struct {
+	MonitorID      int     `json:"monitor_id"`
+	URL            string  `json:"url"`
+	WebhookURL     *string `json:"webhook_url,omitempty"`
+	Name           string  `json:"name"`
+	PreviousStatus string  `json:"previous_status"`
+}
+
+type DiscordField struct {
+	Name   string `json:"name"`
+	Value  string `json:"value"`
+	Inline bool   `json:"inline"`
+}
+
+type DiscordEmbed struct {
+	Title       string         `json:"title"`
+	Description string         `json:"description"`
+	Color       int            `json:"color"`
+	Fields      []DiscordField `json:"fields"`
+	Timestamp   string         `json:"timestamp"`
+}
+
+type DiscordPayload struct {
+	Username  string         `json:"username"`
+	AvatarURL string         `json:"avatar_url"`
+	Embeds    []DiscordEmbed `json:"embeds"`
+}
+
 var db *sql.DB
 var jwtSecret []byte
+var rdb *redis.Client
+
+func initRedis() {
+	redisAddr := os.Getenv("REDIS_ADDR")
+
+	rdb = redis.NewClient(&redis.Options{
+		Addr: redisAddr,
+	})
+
+	ctx := context.Background()
+	_, err := rdb.Ping(ctx).Result()
+	if err != nil {
+		log.Fatalf("Could not connect to redis: %v", err)
+	}
+
+	fmt.Println("Connected to redis successfully")
+}
 
 func enableCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -67,6 +117,53 @@ func enableCORS(next http.Handler) http.Handler {
 	})
 }
 
+func sendDiscordAlert(webhookURL string, job CheckJob, res Result, newStatus string) {
+	color := 15158332
+	title := fmt.Sprintf("🚨 Incident Detected: %s is DOWN", job.Name)
+	desc := fmt.Sprintf("Target URL %s is unreachable or returned an error.", job.URL)
+
+	if newStatus == "up" {
+		color = 3066993
+		title = fmt.Sprintf("✅ Incident Resolved: %s is BACK UP", job.Name)
+		desc = fmt.Sprintf("Target URL %s is responding normally.", job.URL)
+	}
+
+	fields := []DiscordField{
+		{Name: "Status Code", Value: fmt.Sprintf("%d", res.Status), Inline: true},
+		{Name: "Latency", Value: fmt.Sprintf("%d ms", res.Latency.Milliseconds()), Inline: true},
+		{Name: "Checked At", Value: time.Now().Format("15:04:05 MST"), Inline: true},
+	}
+
+	payload := DiscordPayload{
+		Username: "WatchDawg",
+		Embeds: []DiscordEmbed{
+			{
+				Title:       title,
+				Description: desc,
+				Color:       color,
+				Fields:      fields,
+				Timestamp:   time.Now().UTC().Format(time.RFC3339),
+			},
+		},
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("Failed to marshal discord payload: %v\n", err)
+		return
+	}
+
+	client := http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Post(webhookURL, "application/json", bytes.NewBuffer(payloadBytes))
+	if err != nil {
+		log.Printf("Failed to send discord webhook: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	log.Printf("Discord alert sent for %s (Status: %s)\n", job.Name, newStatus)
+}
+
 func checkSite(url string) Result {
 	start := time.Now()
 
@@ -74,23 +171,57 @@ func checkSite(url string) Result {
 		Timeout: 5 * time.Second,
 	}
 
-	resp, err := client.Get(url)
-
-	duration := time.Since(start)
+	req, err := http.NewRequest("GET", url, nil)
 
 	if err != nil {
 		return Result{
-			URL:     url,
-			Latency: duration,
-			Success: false,
+			URL:          url,
+			Latency:      time.Since(start),
+			Success:      false,
+			ErrorMessage: "Invalid URL format",
 		}
 	}
 
+	req.Header.Set("User-Agent", "WatchDawg/1.0 (+https://github.com/taco58/uptime)")
+
+	resp, err := client.Do(req)
+	duration := time.Since(start)
+
+	if err != nil {
+		errMsg := "Network Error"
+
+		var netErr net.Error
+		var dnsErr *net.DNSError
+		if errors.As(err, &dnsErr) {
+			errMsg = fmt.Sprintf("DNS Lookup Failed (%s)", dnsErr.Name)
+		} else if errors.As(err, &netErr) && netErr.Timeout() {
+			errMsg = "Connection Timed Out (> 5000ms)"
+		} else {
+			errMsg = err.Error()
+		}
+
+		return Result{
+			URL:          url,
+			Latency:      duration,
+			Success:      false,
+			ErrorMessage: errMsg,
+		}
+	}
+
+	defer resp.Body.Close()
+
+	isSuccess := resp.StatusCode >= 200 && resp.StatusCode <= 399
+	var errMsg string
+	if !isSuccess {
+		errMsg = fmt.Sprintf("HTTP %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+	}
+
 	return Result{
-		URL:     url,
-		Status:  resp.StatusCode,
-		Latency: duration,
-		Success: resp.StatusCode >= 200 && resp.StatusCode <= 399,
+		URL:          url,
+		Status:       resp.StatusCode,
+		Latency:      duration,
+		Success:      isSuccess,
+		ErrorMessage: errMsg,
 	}
 
 }
@@ -98,7 +229,7 @@ func checkSite(url string) Result {
 func handleGetWebsites(w http.ResponseWriter, r *http.Request) {
 	userID := r.Context().Value("user_id").(int)
 
-	rows, err := db.Query("SELECT id, name, url, status FROM monitors WHERE user_id = $1", userID)
+	rows, err := db.Query("SELECT id, name, url, status, webhook_url FROM monitors WHERE user_id = $1", userID)
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
@@ -108,7 +239,7 @@ func handleGetWebsites(w http.ResponseWriter, r *http.Request) {
 	var list = []Website{}
 	for rows.Next() {
 		var site Website
-		if err := rows.Scan(&site.ID, &site.Name, &site.URL, &site.Status); err != nil {
+		if err := rows.Scan(&site.ID, &site.Name, &site.URL, &site.Status, &site.WebhookURL); err != nil {
 			http.Error(w, "Error scanning row", http.StatusInternalServerError)
 			return
 		}
@@ -134,8 +265,8 @@ func handleCreateWebsite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = db.QueryRow("INSERT INTO monitors (name, url, status, user_id) VALUES ($1, $2, $3, $4) RETURNING id",
-		newSite.Name, newSite.URL, "unknown", userID).Scan(&newSite.ID)
+	err = db.QueryRow("INSERT INTO monitors (name, url, status, user_id, webhook_url) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+		newSite.Name, newSite.URL, "unknown", userID, newSite.WebhookURL).Scan(&newSite.ID)
 
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
@@ -157,7 +288,7 @@ func handleGetWebsiteByID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var site Website
-	err = db.QueryRow("SELECT id, name, url, status FROM monitors where id = $1 AND user_id = $2", id, userID).Scan(&site.ID, &site.Name, &site.URL, &site.Status)
+	err = db.QueryRow("SELECT id, name, url, status, webhook_url FROM monitors where id = $1 AND user_id = $2", id, userID).Scan(&site.ID, &site.Name, &site.URL, &site.Status, &site.WebhookURL)
 
 	if err == sql.ErrNoRows {
 		http.Error(w, "Website not found", http.StatusNotFound)
@@ -317,55 +448,127 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func checkAllMonitors() {
-	rows, err := db.Query("SELECT id, url FROM monitors")
+// func checkAllMonitors() {
+// 	rows, err := db.Query("SELECT id, url FROM monitors")
 
+// 	if err != nil {
+// 		fmt.Println(err)
+// 		return
+// 	}
+// 	defer rows.Close()
+
+// 	var wg sync.WaitGroup
+
+// 	for rows.Next() {
+// 		var site Website
+// 		if err := rows.Scan(&site.ID, &site.URL); err != nil {
+// 			fmt.Println(err)
+// 			return
+// 		}
+// 		wg.Add(1)
+
+// 		go func(s Website) {
+// 			defer wg.Done()
+
+// 			res := checkSite(s.URL)
+
+// 			db.Exec("INSERT INTO checks (monitor_id, status_code, latency_ms, success) VALUES ($1, $2, $3, $4)", s.ID, res.Status, res.Latency.Milliseconds(), res.Success)
+
+// 			status := "down"
+
+// 			if res.Success {
+// 				status = "up"
+// 			}
+
+// 			db.Exec("UPDATE monitors SET status = $1 WHERE id = $2", status, s.ID)
+// 		}(site)
+// 	}
+
+// 	wg.Wait()
+
+// 	if rows.Err() != nil {
+// 		fmt.Println(err)
+// 		return
+// 	}
+// }
+
+// func startBackgroundChecker() {
+// 	ticker := time.NewTicker(10 * time.Second)
+
+// 	for range ticker.C {
+// 		checkAllMonitors()
+// 	}
+// }
+
+func scheduleChecks() {
+	ctx := context.Background()
+	rows, err := db.Query("SELECT id, name, url, status, webhook_url FROM monitors")
 	if err != nil {
-		fmt.Println(err)
+		log.Println("Error querying monitors:", err)
 		return
 	}
 	defer rows.Close()
 
-	var wg sync.WaitGroup
-
 	for rows.Next() {
-		var site Website
-		if err := rows.Scan(&site.ID, &site.URL); err != nil {
-			fmt.Println(err)
-			return
+		var job CheckJob
+		if err := rows.Scan(&job.MonitorID, &job.Name, &job.URL, &job.PreviousStatus, &job.WebhookURL); err != nil {
+			log.Println("Error scanning monitor:", err)
+			continue
 		}
-		wg.Add(1)
 
-		go func(s Website) {
-			defer wg.Done()
+		jobBytes, _ := json.Marshal(job)
 
-			res := checkSite(s.URL)
-
-			db.Exec("INSERT INTO checks (monitor_id, status_code, latency_ms, success) VALUES ($1, $2, $3, $4)", s.ID, res.Status, res.Latency.Milliseconds(), res.Success)
-
-			status := "down"
-
-			if res.Success {
-				status = "up"
-			}
-
-			db.Exec("UPDATE monitors SET status = $1 WHERE id = $2", status, s.ID)
-		}(site)
+		err = rdb.LPush(ctx, "check_queue", string(jobBytes)).Err()
+		if err != nil {
+			log.Println("Failed to enqueue job:", err)
+		}
 	}
 
-	wg.Wait()
-
 	if rows.Err() != nil {
-		fmt.Println(err)
+		log.Println("Error querying monitors:", err)
 		return
 	}
 }
 
-func startBackgroundChecker() {
-	ticker := time.NewTicker(10 * time.Second)
+func startWorker(workerID int) {
+	ctx := context.Background()
+	fmt.Printf("Worker %d started\n", workerID)
 
-	for range ticker.C {
-		checkAllMonitors()
+	for {
+		result, err := rdb.BRPop(ctx, 0, "check_queue").Result()
+		if err != nil {
+			log.Printf("Worker %d error popping job: %v\n", workerID, err)
+			continue
+		}
+
+		var job CheckJob
+		if err := json.Unmarshal([]byte(result[1]), &job); err != nil {
+			log.Printf("Worker %d failed to parse job: %v\n", workerID, err)
+			continue
+		}
+
+		res := checkSite(job.URL)
+
+		_, err = db.Exec(
+			"INSERT INTO checks (monitor_id, status_code, latency_ms, success) VALUES ($1, $2, $3, $4)",
+			job.MonitorID, res.Status, res.Latency.Milliseconds(), res.Success,
+		)
+		if err != nil {
+			log.Printf("Worker %d failed to save check: %v\n", workerID, err)
+		}
+
+		status := "down"
+		if res.Success {
+			status = "up"
+		}
+
+		if job.PreviousStatus != "unknown" && job.PreviousStatus != status && job.WebhookURL != nil && *job.WebhookURL != "" {
+			go sendDiscordAlert(*job.WebhookURL, job, res, status)
+		}
+
+		_, _ = db.Exec("UPDATE monitors SET status = $1 WHERE id = $2", status, job.MonitorID)
+
+		fmt.Printf("Worker %d checked %s -> %s (%dms)\n", workerID, job.URL, status, res.Latency.Milliseconds())
 	}
 }
 
@@ -391,6 +594,8 @@ func main() {
 	}
 	fmt.Println("Connected to PostgreSQL successfully!")
 
+	initRedis()
+
 	http.HandleFunc("GET /websites", requireAuth(handleGetWebsites))
 	http.HandleFunc("GET /websites/{id}", requireAuth(handleGetWebsiteByID))
 	http.HandleFunc("POST /websites", requireAuth(handleCreateWebsite))
@@ -398,7 +603,16 @@ func main() {
 	http.HandleFunc("POST /auth/register", handleRegister)
 	http.HandleFunc("POST /auth/login", handleLogin)
 
-	go startBackgroundChecker()
+	for i := 1; i <= 3; i++ {
+		go startWorker(i)
+	}
+
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		for range ticker.C {
+			scheduleChecks()
+		}
+	}()
 
 	http.ListenAndServe(":8080", enableCORS(mux))
 }
