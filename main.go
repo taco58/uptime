@@ -105,7 +105,7 @@ func initRedis() {
 func enableCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
 		if r.Method == "OPTIONS" {
@@ -350,6 +350,48 @@ func handleDeleteWebsite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func handleUpdateWebsite(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.Atoi(idStr)
+	userID := r.Context().Value("user_id").(int)
+
+	if err != nil {
+		http.Error(w, "Invalid ID", http.StatusBadRequest)
+		return
+	}
+
+	var updatedSite Website
+	err = json.NewDecoder(r.Body).Decode(&updatedSite)
+	if err != nil {
+		http.Error(w, "Invalid body request", http.StatusBadRequest)
+		return
+	}
+
+	if updatedSite.Name == "" || updatedSite.URL == "" {
+		http.Error(w, "Name and URL are required", http.StatusBadRequest)
+		return
+	}
+
+	result, err := db.Exec(
+		"UPDATE monitors SET name = $1, url = $2, webhook_url = $3 WHERE id = $4 AND user_id = $5",
+		updatedSite.Name, updatedSite.URL, updatedSite.WebhookURL, id, userID,
+	)
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil || rowsAffected == 0 {
+		http.Error(w, "Website not found", http.StatusNotFound)
+		return
+	}
+
+	updatedSite.ID = id
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(updatedSite)
 }
 
 func handleRegister(w http.ResponseWriter, r *http.Request) {
@@ -624,6 +666,7 @@ func main() {
 	http.HandleFunc("GET /websites", requireAuth(handleGetWebsites))
 	http.HandleFunc("GET /websites/{id}", requireAuth(handleGetWebsiteByID))
 	http.HandleFunc("POST /websites", requireAuth(handleCreateWebsite))
+	http.HandleFunc("PUT /websites/{id}", requireAuth(handleUpdateWebsite))
 	http.HandleFunc("DELETE /websites/{id}", requireAuth(handleDeleteWebsite))
 	http.HandleFunc("POST /auth/register", handleRegister)
 	http.HandleFunc("POST /auth/login", handleLogin)

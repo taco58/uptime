@@ -1,76 +1,79 @@
-"use client";
+"use client"
 
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react"
 
 interface Website {
-  id: number;
-  name: string;
-  url: string;
-  status: "up" | "down" | "unknown" | string;
+  id: number
+  name: string
+  url: string
+  status: "up" | "down" | "unknown" | string
+  webhook_url?: string
 }
 
 function subscribe(callback: () => void) {
-  window.addEventListener("storage", callback);
-  return () => window.removeEventListener("storage", callback);
+  window.addEventListener("storage", callback)
+  return () => window.removeEventListener("storage", callback)
 }
 
 export default function Dashboard() {
   const token = useSyncExternalStore(
     subscribe,
     () => localStorage.getItem("token"),
-    () => null
-  );
+    () => null,
+  )
 
-  const [authMode, setAuthMode] = useState<"login" | "register">("login");
-  const [authError, setAuthError] = useState("");
-  const [monitors, setMonitors] = useState<Website[]>([]);
-  const [isAdding, setIsAdding] = useState(false);
+  const [authMode, setAuthMode] = useState<"login" | "register">("login")
+  const [authError, setAuthError] = useState("")
+  const [monitors, setMonitors] = useState<Website[]>([])
+  const [isAdding, setIsAdding] = useState(false)
+
+  const [editingId, setEditingId] = useState<number | null>(null)
 
   const handleLogout = () => {
-    localStorage.removeItem("token");
-    window.dispatchEvent(new Event("storage"));
-    setMonitors([]);
-  };
+    localStorage.removeItem("token")
+    window.dispatchEvent(new Event("storage"))
+    setMonitors([])
+  }
 
   const handleAuth = async (formData: FormData) => {
-    setAuthError("");
-    const email = formData.get("email") as string;
-    const password = formData.get("password") as string;
+    setAuthError("")
+    const email = formData.get("email") as string
+    const password = formData.get("password") as string
 
-    if (!email || !password) return;
+    if (!email || !password) return
 
     try {
       const endpoint =
         authMode === "login"
           ? "http://localhost:8080/auth/login"
-          : "http://localhost:8080/auth/register";
+          : "http://localhost:8080/auth/register"
 
       const res = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, password }),
-      });
+      })
 
       if (!res.ok) {
-        const errText = await res.text();
-        setAuthError(errText || "Authentication failed");
-        return;
+        const errText = await res.text()
+        setAuthError(errText || "Authentication failed")
+        return
       }
 
-      const data = await res.json();
+      const data = await res.json()
       if (data.token) {
-        localStorage.setItem("token", data.token);
-        window.dispatchEvent(new Event("storage"));
+        localStorage.setItem("token", data.token)
+        window.dispatchEvent(new Event("storage"))
       }
     } catch {
-      setAuthError("Could not connect to backend server");
+      setAuthError("Could not connect to backend server")
     }
-  };
+  }
 
   useEffect(() => {
-    if (!token) return;
+    if (!token) return
 
-    let ignore = false;
+    let ignore = false
 
     const loadData = () => {
       fetch("http://localhost:8080/websites", {
@@ -78,33 +81,34 @@ export default function Dashboard() {
       })
         .then((res) => {
           if (res.status === 401) {
-            handleLogout();
-            return null;
+            handleLogout()
+            return null
           }
-          return res.json();
+          return res.json()
         })
         .then((data) => {
           if (data && !ignore) {
-            setMonitors(data);
+            setMonitors(data)
           }
         })
-        .catch((err) => console.error(err));
-    };
+        .catch((err) => console.error(err))
+    }
 
-    loadData();
-    const interval = setInterval(loadData, 3000);
+    loadData()
+    const interval = setInterval(loadData, 3000)
 
     return () => {
-      ignore = true;
-      clearInterval(interval);
-    };
-  }, [token]);
+      ignore = true
+      clearInterval(interval)
+    }
+  }, [token])
 
   const handleAddMonitor = async (formData: FormData) => {
-    const name = formData.get("name") as string;
-    const url = formData.get("url") as string;
+    const name = formData.get("name") as string
+    const url = formData.get("url") as string
+    const webhook_url = (formData.get("webhook_url") as string) || undefined
 
-    if (!name || !url || !token) return;
+    if (!name || !url || !token) return
 
     try {
       await fetch("http://localhost:8080/websites", {
@@ -113,32 +117,62 @@ export default function Dashboard() {
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ name, url }),
-      });
+        body: JSON.stringify({ name, url, webhook_url }),
+      })
 
-      setIsAdding(false);
+      setIsAdding(false)
     } catch (err) {
-      console.error("Failed to add monitor:", err);
+      console.error("Failed to add monitor:", err)
     }
-  };
+  }
+
+  const handleUpdateMonitor = async (id: number, formData: FormData) => {
+    const name = formData.get("name") as string
+    const url = formData.get("url") as string
+    const webhook_url = (formData.get("webhook_url") as string) || undefined
+
+    if (!name || !url || !token) return
+
+    try {
+      const res = await fetch(`http://localhost:8080/websites/${id}`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ name, url, webhook_url: webhook_url || null }),
+      })
+
+      if (res.ok) {
+        setMonitors((prev) =>
+          prev.map((m) =>
+            m.id === id ? { ...m, name, url, webhook_url } : m,
+          ),
+        )
+        setEditingId(null)
+      }
+    } catch (err) {
+      console.error("Failed to update monitor:", err)
+    }
+  }
 
   const handleDeleteMonitor = async (id: number) => {
-    if (!token) return;
+    if (!token) return
 
     try {
       await fetch(`http://localhost:8080/websites/${id}`, {
         method: "DELETE",
         headers: { Authorization: `Bearer ${token}` },
-      });
-      setMonitors((prev) => prev.filter((m) => m.id !== id));
+      })
+      setMonitors((prev) => prev.filter((m) => m.id !== id))
     } catch (err) {
-      console.error("Failed to delete monitor:", err);
+      console.error("Failed to delete monitor:", err)
     }
-  };
+  }
 
-  const total = monitors.length;
-  const up = monitors.filter((m) => m.status === "up").length;
-  const down = monitors.filter((m) => m.status === "down").length;
+  const total = monitors.length
+  const up = monitors.filter((m) => m.status === "up").length
+  const down = monitors.filter((m) => m.status === "down").length
 
   if (!token) {
     return (
@@ -182,9 +216,7 @@ export default function Dashboard() {
             </div>
 
             {authError && (
-              <div className="text-red-600 text-xs py-1">
-                [!] {authError}
-              </div>
+              <div className="text-red-600 text-xs py-1">[!] {authError}</div>
             )}
 
             <div className="pt-2">
@@ -201,8 +233,8 @@ export default function Dashboard() {
             <button
               type="button"
               onClick={() => {
-                setAuthMode(authMode === "login" ? "register" : "login");
-                setAuthError("");
+                setAuthMode(authMode === "login" ? "register" : "login")
+                setAuthError("")
               }}
               className="text-neutral-500 hover:text-black transition-colors cursor-pointer underline underline-offset-4"
             >
@@ -218,7 +250,7 @@ export default function Dashboard() {
           <span>bcrypt · jwt · go</span>
         </footer>
       </div>
-    );
+    )
   }
 
   return (
@@ -319,6 +351,18 @@ export default function Dashboard() {
                 />
               </div>
             </div>
+            <div className="mb-4">
+              <label className="block text-neutral-400 uppercase text-[10px] mb-1">
+                Discord Webhook URL (Optional)
+              </label>
+              <input
+                type="url"
+                name="webhook_url"
+                placeholder="https://discord.com/api/webhooks/..."
+                className="w-full border-b border-neutral-300 py-1.5 focus:outline-none focus:border-black placeholder:text-neutral-300 text-xs
+                            sm:text-sm bg-transparent"
+              />
+            </div>
             <div className="flex justify-end items-center gap-4 text-xs pt-1">
               <button
                 type="button"
@@ -344,8 +388,74 @@ export default function Dashboard() {
             </div>
           ) : (
             monitors.map((site, index) => {
-              const isUp = site.status === "up";
-              const isDown = site.status === "down";
+              const isUp = site.status === "up"
+              const isDown = site.status === "down"
+              const isEditing = editingId === site.id
+
+              if (isEditing) {
+                return (
+                  <div key={site.id} className="py-4 border-b border-neutral-200">
+                    <form
+                      action={(formData) => handleUpdateMonitor(site.id, formData)}
+                      className="space-y-3 text-xs"
+                    >
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div>
+                          <label className="block text-neutral-400 uppercase text-[9px] mb-1">
+                            Label
+                          </label>
+                          <input
+                            type="text"
+                            name="name"
+                            defaultValue={site.name}
+                            required
+                            className="w-full border-b border-neutral-300 py-1 focus:outline-none focus:border-black text-xs bg-transparent"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-neutral-400 uppercase text-[9px] mb-1">
+                            Target URL
+                          </label>
+                          <input
+                            type="url"
+                            name="url"
+                            defaultValue={site.url}
+                            required
+                            className="w-full border-b border-neutral-300 py-1 focus:outline-none focus:border-black text-xs bg-transparent"
+                          />
+                        </div>
+                      </div>
+                      <div>
+                        <label className="block text-neutral-400 uppercase text-[9px] mb-1">
+                          Discord Webhook URL (Optional)
+                        </label>
+                        <input
+                          type="url"
+                          name="webhook_url"
+                          defaultValue={site.webhook_url || ""}
+                          placeholder="https://discord.com/api/webhooks/..."
+                          className="w-full border-b border-neutral-300 py-1 focus:outline-none focus:border-black text-xs bg-transparent"
+                        />
+                      </div>
+                      <div className="flex justify-end gap-3 pt-1">
+                        <button
+                          type="button"
+                          onClick={() => setEditingId(null)}
+                          className="text-neutral-400 hover:text-black cursor-pointer"
+                        >
+                          cancel
+                        </button>
+                        <button
+                          type="submit"
+                          className="text-black font-semibold hover:underline cursor-pointer"
+                        >
+                          save changes →
+                        </button>
+                      </div>
+                    </form>
+                  </div>
+                )
+              }
 
               return (
                 <div
@@ -363,32 +473,44 @@ export default function Dashboard() {
                       <span className="text-neutral-400 text-[10px] sm:text-xs truncate">
                         {site.url}
                       </span>
+                      {site.webhook_url && (
+                        <span className="text-[9px] text-neutral-400 border border-neutral-400 px-1 py-0.5 rounded tracking-wider uppercase shrink-0">
+                          ⚡ Discord    
+                        </span>
+                      )}
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-3 sm:gap-5 shrink-0">
+                  <div className="flex items-center gap-3 sm:gap-4 shrink-0">
                     <span
                       className={`text-[11px] sm:text-xs tracking-wider uppercase ${
                         isUp
                           ? "text-neutral-900"
                           : isDown
-                          ? "text-red-600 font-semibold"
-                          : "text-neutral-400"
+                            ? "text-red-600 font-semibold"
+                            : "text-neutral-400"
                       }`}
                     >
                       {isUp ? "● up" : isDown ? "■ down" : "○ unknown"}
                     </span>
 
                     <button
+                      onClick={() => setEditingId(site.id)}
+                      className="text-xs text-neutral-400 hover:text-black transition-colors cursor-pointer underline underline-offset-2"
+                    >
+                      edit
+                    </button>
+
+                    <button
                       onClick={() => handleDeleteMonitor(site.id)}
-                      className="text-neutral-300 hover:text-black transition-colors cursor-pointer text-base sm:text-lg font-light w-6 h-6 flex items-center justify-center"
+                      className="text-neutral-300 hover:text-black transition-colors cursor-pointer text-base sm:text-lg font-light w-5 h-5 flex items-center justify-center"
                       title="Remove"
                     >
                       ×
                     </button>
                   </div>
                 </div>
-              );
+              )
             })
           )}
         </div>
@@ -401,5 +523,5 @@ export default function Dashboard() {
         </span>
       </footer>
     </div>
-  );
+  )
 }
