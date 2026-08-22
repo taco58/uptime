@@ -10,6 +10,23 @@ interface Website {
   webhook_url?: string
 }
 
+interface CheckSummary {
+  status_code: number
+  latency_ms: number
+  success: boolean
+  checked_at: string
+}
+
+interface MonitorStats {
+  monitor_id: number
+  uptime_24h: number
+  avg_latency_ms: number
+  p95_latency_ms: number
+  total_checks_24h: number
+  failed_checks_24h: number
+  recent_checks: CheckSummary[]
+}
+
 function subscribe(callback: () => void) {
   window.addEventListener("storage", callback)
   return () => window.removeEventListener("storage", callback)
@@ -28,6 +45,8 @@ export default function Dashboard() {
   const [isAdding, setIsAdding] = useState(false)
 
   const [editingId, setEditingId] = useState<number | null>(null)
+
+  const [statsMap, setStatsMap] = useState<Record<number, MonitorStats>>({})
 
   const handleLogout = () => {
     localStorage.removeItem("token")
@@ -75,25 +94,40 @@ export default function Dashboard() {
 
     let ignore = false
 
-    const loadData = () => {
-      fetch("http://localhost:8080/websites", {
-        headers: { Authorization: `Bearer ${token}` },
-      })
-        .then((res) => {
-          if (res.status === 401) {
-            handleLogout()
-            return null
-          }
-          return res.json()
+    const loadData = async () => {
+      try {
+        const res = await fetch("http://localhost:8080/websites", {
+          headers: { Authorization: `Bearer ${token}` },
         })
-        .then((data) => {
-          if (data && !ignore) {
-            setMonitors(data)
-          }
-        })
-        .catch((err) => console.error(err))
-    }
+        if (res.status === 401) {
+          handleLogout()
+          return
+        }
+        const data: Website[] = await res.json()
+        if (data && !ignore) {
+          setMonitors(data)
 
+          data.forEach(async (site) => {
+            try {
+              const statsRes = await fetch(
+                `http://localhost:8080/websites/${site.id}/stats`,
+                { headers: { Authorization: `Bearer ${token}` } },
+              )
+              if (statsRes.ok) {
+                const statsData: MonitorStats = await statsRes.json()
+                if (!ignore) {
+                  setStatsMap((prev) => ({ ...prev, [site.id]: statsData }))
+                }
+              }
+            } catch (err) {
+              console.error(err)
+            }
+          })
+        }
+      } catch (err) {
+        console.error(err)
+      }
+    }
     loadData()
     const interval = setInterval(loadData, 3000)
 
@@ -145,9 +179,7 @@ export default function Dashboard() {
 
       if (res.ok) {
         setMonitors((prev) =>
-          prev.map((m) =>
-            m.id === id ? { ...m, name, url, webhook_url } : m,
-          ),
+          prev.map((m) => (m.id === id ? { ...m, name, url, webhook_url } : m)),
         )
         setEditingId(null)
       }
@@ -394,9 +426,14 @@ export default function Dashboard() {
 
               if (isEditing) {
                 return (
-                  <div key={site.id} className="py-4 border-b border-neutral-200">
+                  <div
+                    key={site.id}
+                    className="py-4 border-b border-neutral-200"
+                  >
                     <form
-                      action={(formData) => handleUpdateMonitor(site.id, formData)}
+                      action={(formData) =>
+                        handleUpdateMonitor(site.id, formData)
+                      }
                       className="space-y-3 text-xs"
                     >
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -457,58 +494,103 @@ export default function Dashboard() {
                 )
               }
 
+              const siteStats = statsMap[site.id]
+              const history = siteStats?.recent_checks ? [...siteStats.recent_checks].reverse() : []
+
               return (
                 <div
                   key={site.id}
-                  className="py-3.5 sm:py-4 flex items-center justify-between gap-3 sm:gap-4 hover:bg-neutral-50/70 transition-colors px-1 sm:px-2 -mx-1 sm:-mx-2"
+                  className="py-4 flex flex-col gap-3 hover:bg-neutral-50/60 transition-colors px-2 -mx-2 rounded"
                 >
-                  <div className="flex items-start sm:items-baseline gap-2.5 sm:gap-4 min-w-0 flex-1">
-                    <span className="text-neutral-400 text-[10px] sm:text-[11px] w-4 sm:w-5 shrink-0 pt-0.5 sm:pt-0">
-                      {String(index + 1).padStart(2, "0")}
-                    </span>
-                    <div className="min-w-0 flex-1 flex flex-col sm:flex-row sm:items-baseline sm:gap-3">
-                      <span className="text-black text-xs sm:text-sm font-medium truncate">
-                        {site.name}
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="flex items-baseline gap-3 min-w-0 flex-1">
+                      <span className="text-neutral-400 text-[10px] sm:text-[11px] w-4 sm:w-5 shrink-0 pt-0.5 sm:pt-0">
+                        {String(index + 1).padStart(2, "0")}
                       </span>
-                      <span className="text-neutral-400 text-[10px] sm:text-xs truncate">
-                        {site.url}
-                      </span>
-                      {site.webhook_url && (
-                        <span className="text-[9px] text-neutral-400 border border-neutral-400 px-1 py-0.5 rounded tracking-wider uppercase shrink-0">
-                          ⚡ Discord    
+                      <div className="min-w-0 flex-1 flex flex-col sm:flex-row sm:items-baseline sm:gap-3">
+                        <span className="text-black text-xs sm:text-sm font-medium truncate">
+                          {site.name}
                         </span>
-                      )}
+                        <span className="text-neutral-400 text-[10px] sm:text-xs truncate">
+                          {site.url}
+                        </span>
+                        {site.webhook_url && (
+                          <span className="text-[9px] text-neutral-400 border border-neutral-400 px-1 py-0.5 rounded tracking-wider uppercase shrink-0">
+                            Discord
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-3 sm:gap-4 shrink-0">
+                      <span
+                        className={`text-[11px] sm:text-xs tracking-wider uppercase ${
+                          isUp
+                            ? "text-neutral-900"
+                            : isDown
+                              ? "text-red-600 font-semibold"
+                              : "text-neutral-400"
+                        }`}
+                      >
+                        {isUp ? "● up" : isDown ? "■ down" : "○ unknown"}
+                      </span>
+
+                      <button
+                        onClick={() => setEditingId(site.id)}
+                        className="text-xs text-neutral-400 hover:text-black transition-colors cursor-pointer underline underline-offset-2"
+                      >
+                        edit
+                      </button>
+
+                      <button
+                        onClick={() => handleDeleteMonitor(site.id)}
+                        className="text-neutral-300 hover:text-black transition-colors cursor-pointer text-base sm:text-lg font-light w-5 h-5 flex items-center justify-center"
+                        title="Remove"
+                      >
+                        ×
+                      </button>
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-3 sm:gap-4 shrink-0">
-                    <span
-                      className={`text-[11px] sm:text-xs tracking-wider uppercase ${
-                        isUp
-                          ? "text-neutral-900"
-                          : isDown
-                            ? "text-red-600 font-semibold"
-                            : "text-neutral-400"
-                      }`}
-                    >
-                      {isUp ? "● up" : isDown ? "■ down" : "○ unknown"}
-                    </span>
+                  {siteStats && (
+                    <div className="pl-7 space-y-2">
+                      <div className="flex flex-wrap items-center gap-x-6 gap-y-1 text-[10px] text-neutral-400 uppercase tracking-wider">
+                        <div>
+                          Uptime 24h:{" "}
+                          <span className={`font-semibold ${siteStats.uptime_24h < 99 ? "text-red-600" : "text-black"}`}>
+                            {siteStats.uptime_24h.toFixed(1)}%
+                          </span>
+                        </div>
+                        <div>
+                          Avg: <span className="font-semibold text-black">{siteStats.avg_latency_ms}ms</span>
+                        </div>
+                        <div>
+                          P95: <span className="font-semibold text-black">{siteStats.p95_latency_ms}ms</span>
+                        </div>
+                        <div>
+                          Checks: <span className="font-semibold text-black">{siteStats.total_checks_24h}</span>
+                        </div>
+                      </div>
 
-                    <button
-                      onClick={() => setEditingId(site.id)}
-                      className="text-xs text-neutral-400 hover:text-black transition-colors cursor-pointer underline underline-offset-2"
-                    >
-                      edit
-                    </button>
-
-                    <button
-                      onClick={() => handleDeleteMonitor(site.id)}
-                      className="text-neutral-300 hover:text-black transition-colors cursor-pointer text-base sm:text-lg font-light w-5 h-5 flex items-center justify-center"
-                      title="Remove"
-                    >
-                      ×
-                    </button>
-                  </div>
+                      <div className="flex items-center gap-1 h-3">
+                        {history.length === 0 ? (
+                          <span className="text-[10px] text-neutral-300">Collecting checks...</span>
+                        ) : (
+                          history.map((check, i) => (
+                            <div
+                              key={i}
+                              title={`${check.status_code} · ${check.latency_ms}ms · ${new Date(check.checked_at).toLocaleTimeString()}`}
+                              className={`flex-1 h-full rounded-[1px] transition-all cursor-help ${
+                                check.success
+                                  ? "bg-green-900 hover:bg-green-600"
+                                  : "bg-red-600 hover:bg-red-400"
+                              }`}
+                            />
+                          ))
+                        )}
+                      </div>
+                    </div>
+                  )}
                 </div>
               )
             })

@@ -82,6 +82,23 @@ type DiscordPayload struct {
 	Embeds    []DiscordEmbed `json:"embeds"`
 }
 
+type CheckSummary struct {
+	StatusCode int       `json:"status_code"`
+	LatencyMs  int       `json:"latency_ms"`
+	Success    bool      `json:"success"`
+	CheckedAt  time.Time `json:"checked_at"`
+}
+
+type MonitorStats struct {
+	MonitorID       int            `json:"monitor_id"`
+	Uptime24h       float64        `json:"uptime_24h"`
+	AvgLatencyMs    int            `json:"avg_latency_ms"`
+	P95LatencyMs    int            `json:"p95_latency_ms"`
+	TotalChecks24h  int            `json:"total_checks_24h"`
+	FailedChecks24h int            `json:"failed_checks_24h"`
+	RecentChecks    []CheckSummary `json:"recent_checks"`
+}
+
 var db *sql.DB
 var jwtSecret []byte
 var rdb *redis.Client
@@ -515,6 +532,84 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+func handleGetWebsiteStats(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.Atoi(idStr)
+	userID := r.Context().Value("user_id").(int)
+
+	if err != nil {
+		http.Error(w, "Invalid ID", http.StatusBadRequest)
+		return
+	}
+
+	var monitorID int
+	err = db.QueryRow("SELECT id FROM monitors WHERE id = $1 AND user_id = $2", id, userID).Scan(&monitorID)
+	if err == sql.ErrNoRows {
+		http.Error(w, "Website not found", http.StatusNotFound)
+		return
+	} else if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+
+	var totalChecks, successfulChecks, avgLatency, p95Latency int
+	query := `                                                                                                                                   
+            SELECT                                                                                                                                   
+                COUNT(*),                                                                                                                            
+                COALESCE(COUNT(*) FILTER (WHERE success = true), 0),                                                                                 
+                COALESCE(AVG(latency_ms) FILTER (WHERE success = true), 0)::INTEGER,                                                                 
+                COALESCE(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms) FILTER (WHERE success = true), 0)::INTEGER                         
+            FROM checks                                                                                                                              
+            WHERE monitor_id = $1 AND checked_at >= NOW() - INTERVAL '24 hours'                                                                      
+        `
+	err = db.QueryRow(query, id).Scan(&totalChecks, &successfulChecks, &avgLatency, &p95Latency)
+	if err != nil {
+		http.Error(w, "Database error calculating stats", http.StatusInternalServerError)
+		return
+	}
+
+	uptime24h := 100.0
+	if totalChecks > 0 {
+		uptime24h = (float64(successfulChecks) / float64(totalChecks)) * 100.0
+	}
+
+	recentRows, err := db.Query(
+		"SELECT status_code, latency_ms, success, checked_at FROM checks WHERE monitor_id = $1 ORDER BY id DESC LIMIT 20",
+		id,
+	)
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer recentRows.Close()
+
+	var recentChecks []CheckSummary
+	for recentRows.Next() {
+		var c CheckSummary
+		if err := recentRows.Scan(&c.StatusCode, &c.LatencyMs, &c.Success, &c.CheckedAt); err == nil {
+			recentChecks = append(recentChecks, c)
+		}
+	}
+
+	if err := recentRows.Err(); err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+
+	stats := MonitorStats{
+		MonitorID:       id,
+		Uptime24h:       uptime24h,
+		AvgLatencyMs:    avgLatency,
+		P95LatencyMs:    p95Latency,
+		TotalChecks24h:  totalChecks,
+		FailedChecks24h: totalChecks - successfulChecks,
+		RecentChecks:    recentChecks,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stats)
+}
+
 // func checkAllMonitors() {
 // 	rows, err := db.Query("SELECT id, url FROM monitors")
 
@@ -670,6 +765,7 @@ func main() {
 	http.HandleFunc("DELETE /websites/{id}", requireAuth(handleDeleteWebsite))
 	http.HandleFunc("POST /auth/register", handleRegister)
 	http.HandleFunc("POST /auth/login", handleLogin)
+	http.HandleFunc("GET /websites/{id}/stats", requireAuth(handleGetWebsiteStats))
 
 	for i := 1; i <= 3; i++ {
 		go startWorker(i)
